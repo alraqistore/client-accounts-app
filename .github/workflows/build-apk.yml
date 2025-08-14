@@ -2,13 +2,16 @@ name: Build Android APK (Flutter - Client Accounts)
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-apk.yml"
 
 jobs:
   build-apk:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout (empty repo is fine)
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Flutter
@@ -21,10 +24,9 @@ jobs:
           flutter --version
           flutter create client_accounts_app
 
-      - name: Replace main.dart with our app code
+      - name: Inject main.dart (app code)
         run: |
-          cat > client_accounts_app/lib/main.dart <<'DART'
-// lib/main.dart
+          cat <<'DART' > client_accounts_app/lib/main.dart
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
@@ -418,13 +420,12 @@ class AppDb {
   Future<int> addCustomer(Customer c) async {
     final d = await db;
     final id = await d.insert('customers', c.toInsertMap());
-    // ثبّت الرصيد الافتتاحي كحركة "عليه" إن وجد
     if (c.openingBalance > 0) {
       final serial = await _nextCounter('ledger_serial');
       await d.insert('ledger', LedgerEntry(
         customerId: id,
         type: 'opening',
-        debit: c.openingBalance, // عليه
+        debit: c.openingBalance,
         credit: 0,
         note: 'رصيد افتتاحي',
         createdAt: DateTime.now(),
@@ -436,13 +437,11 @@ class AppDb {
 
   Future<int> updateCustomer(Customer c) async {
     final d = await db;
-    // ملاحظة: لا نعدّل حركة الرصيد الافتتاحي تلقائياً عند تعديل العميل
     return d.update('customers', c.toInsertMap(), where: 'id=?', whereArgs: [c.id]);
   }
 
   Future<int> deleteCustomer(int id) async {
     final d = await db;
-    // سيحذف ledger/fk إن فعّلنا قيود FK في sqflite لاحقاً، الآن نحذف يدوياً:
     await d.delete('ledger', where: 'customer_id=?', whereArgs: [id]);
     await d.delete('invoices', where: 'customer_id=?', whereArgs: [id]);
     await d.delete('receipts', where: 'customer_id=?', whereArgs: [id]);
@@ -452,7 +451,6 @@ class AppDb {
   Future<List<Map<String, dynamic>>> getLedgerForCustomer(int customerId) async {
     final d = await db;
     final rows = await d.query('ledger', where: 'customer_id=?', whereArgs: [customerId], orderBy: 'id ASC');
-    // احسب الرصيد الجاري (running)
     double running = 0;
     final out = <Map<String, dynamic>>[];
     for (final r in rows) {
@@ -488,7 +486,7 @@ class AppDb {
     await d.insert('ledger', LedgerEntry(
       customerId: customerId,
       type: 'invoice',
-      debit: amount, // عليه
+      debit: amount,
       credit: 0,
       note: "فاتورة رقم $invNo - $note",
       createdAt: now,
@@ -516,7 +514,7 @@ class AppDb {
       customerId: customerId,
       type: 'receipt',
       debit: 0,
-      credit: amount, // له
+      credit: amount,
       note: "سند قبض رقم $rNo - $note",
       createdAt: now,
       serial: serial,
@@ -1021,7 +1019,7 @@ class _NewReceiptScreenState extends State<NewReceiptScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               const Text("استعراض سندات القبض", style: TextStyle(fontWeight: FontWeight.w700)),
-              const SizedBox(height: 8),
+              const Sizedوى height: 8),
               TextField(
                 decoration: const InputDecoration(prefixIcon: Icon(Icons.search), hintText: "بحث برقم السند أو اسم العميل"),
                 onChanged: (v)=> setState(()=> _search = v),
@@ -1210,8 +1208,9 @@ DART
         working-directory: client_accounts_app
         run: |
           flutter pub add sqflite path path_provider intl pdf printing
+          flutter pub get
 
-      - name: Build debug APK (no keystore needed)
+      - name: Build debug APK
         working-directory: client_accounts_app
         run: |
           flutter build apk --debug
