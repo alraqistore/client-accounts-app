@@ -1,0 +1,1223 @@
+name: Build Android APK (Flutter - Client Accounts)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (empty repo is fine)
+        uses: actions/checkout@v4
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Create Flutter project
+        run: |
+          flutter --version
+          flutter create client_accounts_app
+
+      - name: Replace main.dart with our app code
+        run: |
+          cat > client_accounts_app/lib/main.dart <<'DART'
+// lib/main.dart
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+import 'package:sqflite/sqflite.dart';
+import 'package:pdf/widgets.dart' as pw;
+import 'package:printing/printing.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const ClientAccountsApp());
+}
+
+/// ألوان وتنسيق عام
+const kGreenStart = Color(0xFF22C55E);
+const kGreenEnd   = Color(0xFF16A34A);
+const kGreenDeep  = Color(0xFF065F46);
+const kGreenLite  = Color(0xFFECFDF5);
+
+final currency = NumberFormat("#,##0.00", "ar_SA");
+final dateFmt  = DateFormat("yyyy/MM/dd HH:mm", "ar_SA");
+
+class ClientAccountsApp extends StatelessWidget {
+  const ClientAccountsApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final baseTheme = ThemeData(
+      useMaterial3: true,
+      colorScheme: ColorScheme.fromSeed(seedColor: kGreenStart),
+      scaffoldBackgroundColor: Colors.white,
+      appBarTheme: const AppBarTheme(
+        centerTitle: true,
+        backgroundColor: Colors.white,
+        foregroundColor: kGreenDeep,
+        elevation: 0,
+      ),
+      inputDecorationTheme: InputDecorationTheme(
+        filled: true,
+        fillColor: kGreenLite,
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(14),
+          borderSide: BorderSide.none,
+        ),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      ),
+      cardTheme: CardTheme(
+        color: Colors.white,
+        elevation: 1.5,
+        margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      ),
+    );
+
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      locale: const Locale('ar'),
+      theme: baseTheme.copyWith(
+        elevatedButtonTheme: ElevatedButtonThemeData(
+          style: ElevatedButton.styleFrom(
+            foregroundColor: Colors.white,
+            backgroundColor: kGreenStart,
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          ),
+        ),
+      ),
+      home: const HomeScreen(),
+    );
+  }
+}
+
+/// شاشات رئيسية
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  int _tab = 0;
+
+  final _pages = const [
+    CustomersScreen(),
+    NewInvoiceScreen(),
+    NewReceiptScreen(),
+    StatementScreen(),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const GradientTitle(text: "إدارة حسابات العملاء"),
+      ),
+      body: _pages[_tab],
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _tab,
+        onDestinationSelected: (i) => setState(() => _tab = i),
+        indicatorColor: kGreenLite,
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.people_alt_outlined), selectedIcon: Icon(Icons.people_alt), label: "العملاء"),
+          NavigationDestination(icon: Icon(Icons.receipt_long_outlined), selectedIcon: Icon(Icons.receipt_long), label: "فاتورة"),
+          NavigationDestination(icon: Icon(Icons.payments_outlined), selectedIcon: Icon(Icons.payments), label: "سند قبض"),
+          NavigationDestination(icon: Icon(Icons.account_balance_wallet_outlined), selectedIcon: Icon(Icons.account_balance_wallet), label: "كشف حساب"),
+        ],
+      ),
+    );
+  }
+}
+
+class GradientTitle extends StatelessWidget {
+  final String text;
+  const GradientTitle({super.key, required this.text});
+  @override
+  Widget build(BuildContext context) {
+    return ShaderMask(
+      shaderCallback: (rect) => const LinearGradient(
+        colors: [kGreenStart, kGreenEnd],
+      ).createShader(rect),
+      child: Text(text, style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w700)),
+    );
+  }
+}
+
+/// نموذج قواعد البيانات
+class Customer {
+  final int? id;
+  final String name;
+  final String phone;
+  final String address;
+  final double openingBalance; // الرصيد الافتتاحي (يثبت "عليه" عند الإنشاء)
+  final double balance;        // للعرض فقط: يُحتسب من الحركات
+
+  Customer({
+    this.id,
+    required this.name,
+    required this.phone,
+    required this.address,
+    required this.openingBalance,
+    this.balance = 0.0,
+  });
+
+  Customer copyWith({int? id, String? name, String? phone, String? address, double? openingBalance, double? balance}) {
+    return Customer(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      phone: phone ?? this.phone,
+      address: address ?? this.address,
+      openingBalance: openingBalance ?? this.openingBalance,
+      balance: balance ?? this.balance,
+    );
+  }
+
+  static Customer fromMap(Map<String, dynamic> m, {double computedBalance = 0}) {
+    return Customer(
+      id: m['id'] as int?,
+      name: m['name'] ?? '',
+      phone: m['phone'] ?? '',
+      address: m['address'] ?? '',
+      openingBalance: (m['opening_balance'] ?? 0).toDouble(),
+      balance: computedBalance,
+    );
+  }
+
+  Map<String, dynamic> toInsertMap() => {
+    'name': name,
+    'phone': phone,
+    'address': address,
+    'opening_balance': openingBalance,
+  };
+}
+
+/// حركة كشف الحساب (فاتورة/سند قبض/رصيد افتتاحي)
+class LedgerEntry {
+  final int? id;
+  final int customerId;
+  final String type; // 'invoice' أو 'receipt' أو 'opening'
+  final double debit;  // عليه
+  final double credit; // له
+  final String note;
+  final DateTime createdAt;
+  final int serial; // رقم تسلسلي داخل كشف الحساب
+
+  LedgerEntry({
+    this.id,
+    required this.customerId,
+    required this.type,
+    required this.debit,
+    required this.credit,
+    required this.note,
+    required this.createdAt,
+    required this.serial,
+  });
+
+  Map<String, dynamic> toInsertMap() => {
+    'customer_id': customerId,
+    'type': type,
+    'debit': debit,
+    'credit': credit,
+    'note': note,
+    'created_at': createdAt.millisecondsSinceEpoch,
+    'serial': serial,
+  };
+
+  static LedgerEntry fromMap(Map<String, dynamic> m) {
+    return LedgerEntry(
+      id: m['id'] as int?,
+      customerId: m['customer_id'],
+      type: m['type'],
+      debit: (m['debit'] ?? 0).toDouble(),
+      credit: (m['credit'] ?? 0).toDouble(),
+      note: m['note'] ?? '',
+      createdAt: DateTime.fromMillisecondsSinceEpoch(m['created_at']),
+      serial: m['serial'] ?? 0,
+    );
+  }
+}
+
+/// فواتير (للبحث والطباعة)
+class Invoice {
+  final int? id;
+  final int customerId;
+  final String customerName;
+  final double amount;
+  final String note;
+  final DateTime createdAt;
+  final int number; // رقم الفاتورة المتسلسل
+
+  Invoice({this.id, required this.customerId, required this.customerName, required this.amount, required this.note, required this.createdAt, required this.number});
+
+  Map<String, dynamic> toInsertMap() => {
+    'customer_id': customerId,
+    'customer_name': customerName,
+    'amount': amount,
+    'note': note,
+    'created_at': createdAt.millisecondsSinceEpoch,
+    'number': number,
+  };
+
+  static Invoice fromMap(Map<String, dynamic> m) => Invoice(
+    id: m['id'] as int?,
+    customerId: m['customer_id'],
+    customerName: m['customer_name'],
+    amount: (m['amount'] ?? 0).toDouble(),
+    note: m['note'] ?? '',
+    createdAt: DateTime.fromMillisecondsSinceEpoch(m['created_at']),
+    number: m['number'] ?? 0,
+  );
+}
+
+/// سندات قبض (للبحث والطباعة)
+class Receipt {
+  final int? id;
+  final int customerId;
+  final String customerName;
+  final double amount;
+  final String note;
+  final DateTime createdAt;
+  final int number; // رقم السند المتسلسل
+
+  Receipt({this.id, required this.customerId, required this.customerName, required this.amount, required this.note, required this.createdAt, required this.number});
+
+  Map<String, dynamic> toInsertMap() => {
+    'customer_id': customerId,
+    'customer_name': customerName,
+    'amount': amount,
+    'note': note,
+    'created_at': createdAt.millisecondsSinceEpoch,
+    'number': number,
+  };
+
+  static Receipt fromMap(Map<String, dynamic> m) => Receipt(
+    id: m['id'] as int?,
+    customerId: m['customer_id'],
+    customerName: m['customer_name'],
+    amount: (m['amount'] ?? 0).toDouble(),
+    note: m['note'] ?? '',
+    createdAt: DateTime.fromMillisecondsSinceEpoch(m['created_at']),
+    number: m['number'] ?? 0,
+  );
+}
+
+/// طبقة البيانات SQLite
+class AppDb {
+  static final AppDb _i = AppDb._internal();
+  AppDb._internal();
+  factory AppDb() => _i;
+
+  Database? _db;
+
+  Future<Database> get db async {
+    if (_db != null) return _db!;
+    final dir = await getApplicationDocumentsDirectory();
+    final path = p.join(dir.path, "clients_accounts.db");
+    _db = await openDatabase(
+      path,
+      version: 1,
+      onCreate: (db, v) async {
+        await db.execute("""
+          CREATE TABLE customers(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            phone TEXT,
+            address TEXT,
+            opening_balance REAL NOT NULL DEFAULT 0
+          );
+        """);
+        await db.execute("""
+          CREATE TABLE ledger(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            type TEXT NOT NULL, -- invoice/receipt/opening
+            debit REAL NOT NULL DEFAULT 0,  -- عليه
+            credit REAL NOT NULL DEFAULT 0, -- له
+            note TEXT,
+            created_at INTEGER NOT NULL,
+            serial INTEGER NOT NULL,
+            FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE CASCADE
+          );
+        """);
+        await db.execute("""
+          CREATE TABLE invoices(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            customer_name TEXT NOT NULL,
+            amount REAL NOT NULL,
+            note TEXT,
+            created_at INTEGER NOT NULL,
+            number INTEGER NOT NULL,
+            FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE CASCADE
+          );
+        """);
+        await db.execute("""
+          CREATE TABLE receipts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            customer_name TEXT NOT NULL,
+            amount REAL NOT NULL,
+            note TEXT,
+            created_at INTEGER NOT NULL,
+            number INTEGER NOT NULL,
+            FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE CASCADE
+          );
+        """);
+        await db.execute("""
+          CREATE TABLE counters(
+            name TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+          );
+        """);
+        await db.insert('counters', {'name': 'invoice_no', 'value': 0});
+        await db.insert('counters', {'name': 'receipt_no', 'value': 0});
+        await db.insert('counters', {'name': 'ledger_serial', 'value': 0});
+      },
+    );
+    return _db!;
+  }
+
+  Future<int> _nextCounter(String name) async {
+    final d = await db;
+    final tx = await d.transaction((txn) async {
+      final cur = await txn.query('counters', where: 'name=?', whereArgs: [name]);
+      int value = 0;
+      if (cur.isNotEmpty) value = (cur.first['value'] as int);
+      value += 1;
+      await txn.update('counters', {'value': value}, where: 'name=?', whereArgs: [name]);
+      return value;
+    });
+    return tx;
+  }
+
+  Future<List<Customer>> listCustomers({String? q}) async {
+    final d = await db;
+    final where = (q != null && q.trim().isNotEmpty) ? "WHERE name LIKE ? OR phone LIKE ?" : "";
+    final args = (q != null && q.trim().isNotEmpty) ? ['%$q%', '%$q%'] : [];
+    final rows = await d.rawQuery("SELECT * FROM customers $where ORDER BY id DESC", args);
+    // احسب الرصيد الفعلي لكل عميل (له - عليه)
+    List<Customer> out = [];
+    for (final m in rows) {
+      final cid = m['id'] as int;
+      final led = await d.rawQuery("SELECT SUM(credit) AS cr, SUM(debit) AS dr FROM ledger WHERE customer_id=?", [cid]);
+      final cr = (led.first['cr'] ?? 0).toDouble();
+      final dr = (led.first['dr'] ?? 0).toDouble();
+      out.add(Customer.fromMap(m, computedBalance: cr - dr));
+    }
+    return out;
+  }
+
+  Future<int> addCustomer(Customer c) async {
+    final d = await db;
+    final id = await d.insert('customers', c.toInsertMap());
+    // ثبّت الرصيد الافتتاحي كحركة "عليه" إن وجد
+    if (c.openingBalance > 0) {
+      final serial = await _nextCounter('ledger_serial');
+      await d.insert('ledger', LedgerEntry(
+        customerId: id,
+        type: 'opening',
+        debit: c.openingBalance, // عليه
+        credit: 0,
+        note: 'رصيد افتتاحي',
+        createdAt: DateTime.now(),
+        serial: serial,
+      ).toInsertMap());
+    }
+    return id;
+  }
+
+  Future<int> updateCustomer(Customer c) async {
+    final d = await db;
+    // ملاحظة: لا نعدّل حركة الرصيد الافتتاحي تلقائياً عند تعديل العميل
+    return d.update('customers', c.toInsertMap(), where: 'id=?', whereArgs: [c.id]);
+  }
+
+  Future<int> deleteCustomer(int id) async {
+    final d = await db;
+    // سيحذف ledger/fk إن فعّلنا قيود FK في sqflite لاحقاً، الآن نحذف يدوياً:
+    await d.delete('ledger', where: 'customer_id=?', whereArgs: [id]);
+    await d.delete('invoices', where: 'customer_id=?', whereArgs: [id]);
+    await d.delete('receipts', where: 'customer_id=?', whereArgs: [id]);
+    return d.delete('customers', where: 'id=?', whereArgs: [id]);
+  }
+
+  Future<List<Map<String, dynamic>>> getLedgerForCustomer(int customerId) async {
+    final d = await db;
+    final rows = await d.query('ledger', where: 'customer_id=?', whereArgs: [customerId], orderBy: 'id ASC');
+    // احسب الرصيد الجاري (running)
+    double running = 0;
+    final out = <Map<String, dynamic>>[];
+    for (final r in rows) {
+      final entry = LedgerEntry.fromMap(r);
+      running += entry.credit - entry.debit;
+      out.add({
+        'serial': entry.serial,
+        'note': entry.note,
+        'debit': entry.debit,
+        'credit': entry.credit,
+        'balance': running,
+        'type': entry.type,
+        'createdAt': entry.createdAt,
+      });
+    }
+    return out;
+  }
+
+  Future<int> addInvoice({required int customerId, required String customerName, required double amount, required String note}) async {
+    final d = await db;
+    final invNo = await _nextCounter('invoice_no');
+    final now = DateTime.now();
+    final id = await d.insert('invoices', Invoice(
+      customerId: customerId,
+      customerName: customerName,
+      amount: amount,
+      note: note,
+      createdAt: now,
+      number: invNo,
+    ).toInsertMap());
+
+    final serial = await _nextCounter('ledger_serial');
+    await d.insert('ledger', LedgerEntry(
+      customerId: customerId,
+      type: 'invoice',
+      debit: amount, // عليه
+      credit: 0,
+      note: "فاتورة رقم $invNo - $note",
+      createdAt: now,
+      serial: serial,
+    ).toInsertMap());
+
+    return id;
+  }
+
+  Future<int> addReceipt({required int customerId, required String customerName, required double amount, required String note}) async {
+    final d = await db;
+    final rNo = await _nextCounter('receipt_no');
+    final now = DateTime.now();
+    final id = await d.insert('receipts', Receipt(
+      customerId: customerId,
+      customerName: customerName,
+      amount: amount,
+      note: note,
+      createdAt: now,
+      number: rNo,
+    ).toInsertMap());
+
+    final serial = await _nextCounter('ledger_serial');
+    await d.insert('ledger', LedgerEntry(
+      customerId: customerId,
+      type: 'receipt',
+      debit: 0,
+      credit: amount, // له
+      note: "سند قبض رقم $rNo - $note",
+      createdAt: now,
+      serial: serial,
+    ).toInsertMap());
+
+    return id;
+  }
+
+  Future<List<Invoice>> searchInvoices({String? byNumberOrName}) async {
+    final d = await db;
+    if (byNumberOrName != null && byNumberOrName.trim().isNotEmpty) {
+      final q = byNumberOrName.trim();
+      final rows = await d.rawQuery("""
+        SELECT * FROM invoices
+        WHERE CAST(number AS TEXT) LIKE ? OR customer_name LIKE ?
+        ORDER BY id DESC
+      """, ['%$q%', '%$q%']);
+      return rows.map(Invoice.fromMap).toList();
+    }
+    final rows = await d.query('invoices', orderBy: 'id DESC');
+    return rows.map(Invoice.fromMap).toList();
+  }
+
+  Future<List<Receipt>> searchReceipts({String? byNumberOrName}) async {
+    final d = await db;
+    if (byNumberOrName != null && byNumberOrName.trim().isNotEmpty) {
+      final q = byNumberOrName.trim();
+      final rows = await d.rawQuery("""
+        SELECT * FROM receipts
+        WHERE CAST(number AS TEXT) LIKE ? OR customer_name LIKE ?
+        ORDER BY id DESC
+      """, ['%$q%', '%$q%']);
+      return rows.map(Receipt.fromMap).toList();
+    }
+    final rows = await d.query('receipts', orderBy: 'id DESC');
+    return rows.map(Receipt.fromMap).toList();
+  }
+}
+
+/// أدوات UI صغيرة
+class GCard extends StatelessWidget {
+  final Widget child;
+  const GCard({super.key, required this.child});
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      child: Container(
+        decoration: const BoxDecoration(
+          borderRadius: BorderRadius.all(Radius.circular(16)),
+        ),
+        padding: const EdgeInsets.all(12),
+        child: child,
+      ),
+    );
+  }
+}
+
+class HeaderBar extends StatelessWidget {
+  final String title;
+  final IconData icon;
+  const HeaderBar({super.key, required this.title, required this.icon});
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(colors: [kGreenStart, kGreenEnd]),
+        borderRadius: BorderRadius.all(Radius.circular(16)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: Colors.white),
+          const SizedBox(width: 10),
+          Expanded(child: Text(title, style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w700))),
+        ],
+      ),
+    );
+  }
+}
+
+/// شاشة العملاء
+class CustomersScreen extends StatefulWidget {
+  const CustomersScreen({super.key});
+  @override
+  State<CustomersScreen> createState() => _CustomersScreenState();
+}
+
+class _CustomersScreenState extends State<CustomersScreen> {
+  final _db = AppDb();
+  String _q = "";
+
+  final _name = TextEditingController();
+  final _phone = TextEditingController();
+  final _address = TextEditingController();
+  final _opening = TextEditingController(text: "0");
+
+  Future<void> _openAddDialog({Customer? existing}) async {
+    if (existing != null) {
+      _name.text = existing.name;
+      _phone.text = existing.phone;
+      _address.text = existing.address;
+      _opening.text = existing.openingBalance.toStringAsFixed(2);
+    } else {
+      _name.clear();
+      _phone.clear();
+      _address.clear();
+      _opening.text = "0";
+    }
+
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (ctx) {
+        return Padding(
+          padding: EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom, left: 16, right: 16, top: 16),
+          child: SingleChildScrollView(
+            child: Column(
+              children: [
+                const HeaderBar(title: "بيانات العميل", icon: Icons.person_add_alt_1),
+                const SizedBox(height: 10),
+                TextField(controller: _name, decoration: const InputDecoration(prefixIcon: Icon(Icons.person), hintText: "اسم العميل")),
+                const SizedBox(height: 8),
+                TextField(controller: _phone, decoration: const InputDecoration(prefixIcon: Icon(Icons.phone), hintText: "رقم الهاتف"), keyboardType: TextInputType.phone),
+                const SizedBox(height: 8),
+                TextField(controller: _address, decoration: const InputDecoration(prefixIcon: Icon(Icons.place), hintText: "العنوان")),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: _opening,
+                  decoration: const InputDecoration(prefixIcon: Icon(Icons.account_balance), hintText: "الرصيد الافتتاحي (عليه)"),
+                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        icon: const Icon(Icons.save),
+                        label: const Text("حفظ"),
+                        onPressed: () async {
+                          final name = _name.text.trim();
+                          if (name.isEmpty) { Navigator.pop(ctx); return; }
+                          final phone = _phone.text.trim();
+                          final addr = _address.text.trim();
+                          final opening = double.tryParse(_opening.text.trim()) ?? 0.0;
+
+                          if (existing == null) {
+                            await _db.addCustomer(Customer(name: name, phone: phone, address: addr, openingBalance: opening));
+                          } else {
+                            await _db.updateCustomer(existing.copyWith(name: name, phone: phone, address: addr, openingBalance: opening));
+                          }
+                          if (mounted) setState(() {});
+                          if (context.mounted) Navigator.pop(ctx);
+                        },
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    if (existing != null)
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                          icon: const Icon(Icons.delete_forever),
+                          label: const Text("حذف"),
+                          onPressed: () async {
+                            await _db.deleteCustomer(existing.id!);
+                            if (mounted) setState(() {});
+                            if (context.mounted) Navigator.pop(ctx);
+                          },
+                        ),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        GCard(child: Column(
+          children: [
+            const HeaderBar(title: "إدارة العملاء", icon: Icons.people_alt),
+            const SizedBox(height: 10),
+            TextField(
+              decoration: const InputDecoration(prefixIcon: Icon(Icons.search), hintText: "ابحث بالاسم أو رقم الهاتف"),
+              onChanged: (v) => setState(() => _q = v),
+            ),
+            const SizedBox(height: 10),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: ElevatedButton.icon(
+                icon: const Icon(Icons.person_add_alt_1),
+                label: const Text("إضافة عميل"),
+                onPressed: () => _openAddDialog(),
+              ),
+            ),
+          ],
+        )),
+        Expanded(
+          child: FutureBuilder<List<Customer>>(
+            future: _db.listCustomers(q: _q),
+            builder: (context, snap) {
+              if (!snap.hasData) return const Center(child: CircularProgressIndicator());
+              final list = snap.data!;
+              if (list.isEmpty) return const Center(child: Text("لا يوجد عملاء بعد"));
+              return ListView.builder(
+                itemCount: list.length,
+                itemBuilder: (c, i) {
+                  final e = list[i];
+                  return ListTile(
+                    leading: CircleAvatar(backgroundColor: kGreenLite, child: const Icon(Icons.person, color: kGreenDeep)),
+                    title: Text(e.name, style: const TextStyle(fontWeight: FontWeight.w600)),
+                    subtitle: Text("${e.phone} • ${e.address.isEmpty ? 'بدون عنوان' : e.address}"),
+                    trailing: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Text("الرصيد: ${currency.format(e.balance)}", style: TextStyle(color: e.balance>=0 ? kGreenDeep : Colors.red, fontWeight: FontWeight.w700)),
+                      ],
+                    ),
+                    onTap: () => _openAddDialog(existing: e),
+                  );
+                },
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// اختيار عميل مع بحث
+Future<Customer?> pickCustomer(BuildContext context) async {
+  final db = AppDb();
+  String q = "";
+  return showDialog<Customer>(
+    context: context,
+    builder: (ctx) {
+      return StatefulBuilder(builder: (ctx, setS) {
+        return AlertDialog(
+          title: const Text("اختر العميل"),
+          content: SizedBox(
+            width: 420,
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              TextField(
+                decoration: const InputDecoration(prefixIcon: Icon(Icons.search), hintText: "بحث بالاسم أو رقم الهاتف"),
+                onChanged: (v) { q = v; setS((){}); },
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                height: 300,
+                child: FutureBuilder<List<Customer>>(
+                  future: db.listCustomers(q: q),
+                  builder: (c, snap) {
+                    if (!snap.hasData) return const Center(child: CircularProgressIndicator());
+                    final list = snap.data!;
+                    if (list.isEmpty) return const Center(child: Text("لا نتائج"));
+                    return ListView.builder(
+                      itemCount: list.length,
+                      itemBuilder: (c, i) {
+                        final e = list[i];
+                        return ListTile(
+                          leading: const Icon(Icons.person),
+                          title: Text(e.name),
+                          subtitle: Text(e.phone),
+                          onTap: () => Navigator.pop(ctx, e),
+                        );
+                      },
+                    );
+                  },
+                ),
+              ),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: ()=> Navigator.pop(ctx, null), child: const Text("إلغاء")),
+          ],
+        );
+      });
+    }
+  );
+}
+
+/// فاتورة جديدة (عليه)
+class NewInvoiceScreen extends StatefulWidget {
+  const NewInvoiceScreen({super.key});
+  @override
+  State<NewInvoiceScreen> createState() => _NewInvoiceScreenState();
+}
+
+class _NewInvoiceScreenState extends State<NewInvoiceScreen> {
+  final _db = AppDb();
+  Customer? _selected;
+  final _amount = TextEditingController();
+  final _note = TextEditingController();
+  String _search = "";
+
+  @override
+  Widget build(BuildContext context) {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(8),
+      child: Column(
+        children: [
+          const HeaderBar(title: "فاتورة جديدة (عليه)", icon: Icons.receipt_long),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  readOnly: true,
+                  controller: TextEditingController(text: _selected?.name ?? ""),
+                  decoration: const InputDecoration(prefixIcon: Icon(Icons.person), hintText: "اختر العميل"),
+                  onTap: () async {
+                    final c = await pickCustomer(context);
+                    if (c != null) setState(()=> _selected = c);
+                  },
+                ),
+              ),
+              const SizedBox(width: 8),
+              ElevatedButton.icon(
+                icon: const Icon(Icons.search),
+                label: const Text("بحث"),
+                onPressed: () async {
+                  final c = await pickCustomer(context);
+                  if (c != null) setState(()=> _selected = c);
+                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _amount,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(prefixIcon: Icon(Icons.attach_money), hintText: "المبلغ"),
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _note,
+            decoration: const InputDecoration(prefixIcon: Icon(Icons.description), hintText: "البيان"),
+          ),
+          const SizedBox(height: 10),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: ElevatedButton.icon(
+              icon: const Icon(Icons.save),
+              label: const Text("حفظ الفاتورة"),
+              onPressed: () async {
+                if (_selected == null) return;
+                final amt = double.tryParse(_amount.text.trim()) ?? 0;
+                if (amt <= 0) return;
+                await _db.addInvoice(customerId: _selected!.id!, customerName: _selected!.name, amount: amt, note: _note.text.trim());
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("تم حفظ الفاتورة")));
+                  _amount.clear(); _note.clear();
+                }
+              },
+            ),
+          ),
+          const SizedBox(height: 14),
+          GCard(child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text("استعراض الفواتير", style: TextStyle(fontWeight: FontWeight.w700)),
+              const SizedBox(height: 8),
+              TextField(
+                decoration: const InputDecoration(prefixIcon: Icon(Icons.search), hintText: "بحث برقم الفاتورة أو اسم العميل"),
+                onChanged: (v)=> setState(()=> _search = v),
+              ),
+              const SizedBox(height: 8),
+              FutureBuilder<List<Invoice>>(
+                future: _db.searchInvoices(byNumberOrName: _search),
+                builder: (c, snap) {
+                  if (!snap.hasData) return const Center(child: Padding(padding: EdgeInsets.all(16), child: CircularProgressIndicator()));
+                  final list = snap.data!;
+                  if (list.isEmpty) return const Padding(padding: EdgeInsets.all(16), child: Text("لا توجد فواتير"));
+                  return Column(
+                    children: list.map((e) => ListTile(
+                      leading: const Icon(Icons.receipt),
+                      title: Text("فاتورة #${e.number} - ${e.customerName}"),
+                      subtitle: Text("${currency.format(e.amount)} • ${dateFmt.format(e.createdAt)}"),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.picture_as_pdf),
+                        onPressed: ()=> _printInvoicePdf(e),
+                      ),
+                    )).toList(),
+                  );
+                },
+              ),
+            ],
+          )),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _printInvoicePdf(Invoice inv) async {
+    final doc = pw.Document();
+    doc.addPage(
+      pw.Page(build: (ctx) {
+        return pw.Column(
+          crossAxisAlignment: pw.CrossAxisAlignment.start,
+          children: [
+            pw.Text("فاتورة", style: pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold)),
+            pw.SizedBox(height: 8),
+            pw.Text("رقم: ${inv.number}"),
+            pw.Text("العميل: ${inv.customerName}"),
+            pw.Text("التاريخ: ${dateFmt.format(inv.createdAt)}"),
+            pw.SizedBox(height: 12),
+            pw.Text("المبلغ: ${currency.format(inv.amount)}"),
+            pw.Text("البيان: ${inv.note}"),
+          ],
+        );
+      })
+    );
+    await Printing.layoutPdf(onLayout: (format) async => doc.save());
+  }
+}
+
+/// سند قبض (له)
+class NewReceiptScreen extends StatefulWidget {
+  const NewReceiptScreen({super.key});
+  @override
+  State<NewReceiptScreen> createState() => _NewReceiptScreenState();
+}
+
+class _NewReceiptScreenState extends State<NewReceiptScreen> {
+  final _db = AppDb();
+  Customer? _selected;
+  final _amount = TextEditingController();
+  final _note = TextEditingController();
+  String _search = "";
+
+  @override
+  Widget build(BuildContext context) {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(8),
+      child: Column(
+        children: [
+          const HeaderBar(title: "سند قبض (له)", icon: Icons.payments),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  readOnly: true,
+                  controller: TextEditingController(text: _selected?.name ?? ""),
+                  decoration: const InputDecoration(prefixIcon: Icon(Icons.person), hintText: "اختر العميل"),
+                  onTap: () async {
+                    final c = await pickCustomer(context);
+                    if (c != null) setState(()=> _selected = c);
+                  },
+                ),
+              ),
+              const SizedBox(width: 8),
+              ElevatedButton.icon(
+                icon: const Icon(Icons.search),
+                label: const Text("بحث"),
+                onPressed: () async {
+                  final c = await pickCustomer(context);
+                  if (c != null) setState(()=> _selected = c);
+                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _amount,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(prefixIcon: Icon(Icons.attach_money), hintText: "المبلغ"),
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _note,
+            decoration: const InputDecoration(prefixIcon: Icon(Icons.description), hintText: "البيان"),
+          ),
+          const SizedBox(height: 10),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: ElevatedButton.icon(
+              icon: const Icon(Icons.save),
+              label: const Text("حفظ السند"),
+              onPressed: () async {
+                if (_selected == null) return;
+                final amt = double.tryParse(_amount.text.trim()) ?? 0;
+                if (amt <= 0) return;
+                await _db.addReceipt(customerId: _selected!.id!, customerName: _selected!.name, amount: amt, note: _note.text.trim());
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("تم حفظ السند")));
+                  _amount.clear(); _note.clear();
+                }
+              },
+            ),
+          ),
+          const SizedBox(height: 14),
+          GCard(child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text("استعراض سندات القبض", style: TextStyle(fontWeight: FontWeight.w700)),
+              const SizedBox(height: 8),
+              TextField(
+                decoration: const InputDecoration(prefixIcon: Icon(Icons.search), hintText: "بحث برقم السند أو اسم العميل"),
+                onChanged: (v)=> setState(()=> _search = v),
+              ),
+              const SizedBox(height: 8),
+              FutureBuilder<List<Receipt>>(
+                future: _db.searchReceipts(byNumberOrName: _search),
+                builder: (c, snap) {
+                  if (!snap.hasData) return const Center(child: Padding(padding: EdgeInsets.all(16), child: CircularProgressIndicator()));
+                  final list = snap.data!;
+                  if (list.isEmpty) return const Padding(padding: EdgeInsets.all(16), child: Text("لا توجد سندات"));
+                  return Column(
+                    children: list.map((e) => ListTile(
+                      leading: const Icon(Icons.payments),
+                      title: Text("سند #${e.number} - ${e.customerName}"),
+                      subtitle: Text("${currency.format(e.amount)} • ${dateFmt.format(e.createdAt)}"),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.picture_as_pdf),
+                        onPressed: ()=> _printReceiptPdf(e),
+                      ),
+                    )).toList(),
+                  );
+                },
+              ),
+            ],
+          )),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _printReceiptPdf(Receipt r) async {
+    final doc = pw.Document();
+    doc.addPage(
+      pw.Page(build: (ctx) {
+        return pw.Column(
+          crossAxisAlignment: pw.CrossAxisAlignment.start,
+          children: [
+            pw.Text("سند قبض", style: pw.TextStyle(fontSize: 22, fontWeight: pw.FontWeight.bold)),
+            pw.SizedBox(height: 8),
+            pw.Text("رقم: ${r.number}"),
+            pw.Text("العميل: ${r.customerName}"),
+            pw.Text("التاريخ: ${dateFmt.format(r.createdAt)}"),
+            pw.SizedBox(height: 12),
+            pw.Text("المبلغ: ${currency.format(r.amount)}"),
+            pw.Text("البيان: ${r.note}"),
+          ],
+        );
+      })
+    );
+    await Printing.layoutPdf(onLayout: (format) async => doc.save());
+  }
+}
+
+/// كشف حساب
+class StatementScreen extends StatefulWidget {
+  const StatementScreen({super.key});
+  @override
+  State<StatementScreen> createState() => _StatementScreenState();
+}
+
+class _StatementScreenState extends State<StatementScreen> {
+  final _db = AppDb();
+  Customer? _selected;
+  List<Map<String, dynamic>> _rows = [];
+
+  Future<void> _load() async {
+    if (_selected == null) return;
+    _rows = await _db.getLedgerForCustomer(_selected!.id!);
+    if (mounted) setState((){});
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(8),
+      child: Column(children: [
+        const HeaderBar(title: "كشف حساب", icon: Icons.account_balance_wallet),
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            Expanded(
+              child: TextField(
+                readOnly: true,
+                controller: TextEditingController(text: _selected?.name ?? ""),
+                decoration: const InputDecoration(prefixIcon: Icon(Icons.person), hintText: "اختر العميل"),
+                onTap: () async {
+                  final c = await pickCustomer(context);
+                  if (c != null) { setState(()=> _selected = c); await _load(); }
+                },
+              ),
+            ),
+            const SizedBox(width: 8),
+            ElevatedButton.icon(
+              icon: const Icon(Icons.search),
+              label: const Text("بحث"),
+              onPressed: () async {
+                final c = await pickCustomer(context);
+                if (c != null) { setState(()=> _selected = c); await _load(); }
+              },
+            ),
+            const SizedBox(width: 8),
+            if (_selected != null)
+              ElevatedButton.icon(
+                icon: const Icon(Icons.picture_as_pdf),
+                label: const Text("طباعة PDF"),
+                onPressed: _printStatementPdf,
+              ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        if (_selected == null)
+          const Padding(
+            padding: EdgeInsets.all(16),
+            child: Text("اختر عميل لعرض كشف الحساب"),
+          )
+        else
+          Card(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: DataTable(
+                columns: const [
+                  DataColumn(label: Text("تسلسل")),
+                  DataColumn(label: Text("التاريخ")),
+                  DataColumn(label: Text("البيان")),
+                  DataColumn(label: Text("عليه")),
+                  DataColumn(label: Text("له")),
+                  DataColumn(label: Text("الرصيد")),
+                ],
+                rows: _rows.map((r) {
+                  return DataRow(cells: [
+                    DataCell(Text("${r['serial']}")),
+                    DataCell(Text(dateFmt.format(r['createdAt']))),
+                    DataCell(Text(r['note'])),
+                    DataCell(Text(currency.format(r['debit']))),
+                    DataCell(Text(currency.format(r['credit']))),
+                    DataCell(Text(currency.format(r['balance']))),
+                  ]);
+                }).toList(),
+              ),
+            ),
+          ),
+      ]),
+    );
+  }
+
+  Future<void> _printStatementPdf() async {
+    final doc = pw.Document();
+    final rows = _rows;
+    final totalDebit = rows.fold<double>(0, (a, r) => a + (r['debit'] as double));
+    final totalCredit = rows.fold<double>(0, (a, r) => a + (r['credit'] as double));
+    final finalBalance = totalCredit - totalDebit;
+
+    doc.addPage(
+      pw.Page(build: (ctx) {
+        return pw.Column(
+          crossAxisAlignment: pw.CrossAxisAlignment.start,
+          children: [
+            pw.Text("كشف حساب - ${_selected!.name}", style: pw.TextStyle(fontSize: 18, fontWeight: pw.FontWeight.bold)),
+            pw.SizedBox(height: 8),
+            pw.Table.fromTextArray(
+              headers: const ["تسلسل","التاريخ","البيان","عليه","له","الرصيد"],
+              data: rows.map((r) => [
+                r['serial'],
+                dateFmt.format(r['createdAt']),
+                r['note'],
+                currency.format(r['debit']),
+                currency.format(r['credit']),
+                currency.format(r['balance']),
+              ]).toList(),
+            ),
+            pw.SizedBox(height: 12),
+            pw.Text("الإجمالي عليه: ${currency.format(totalDebit)}"),
+            pw.Text("الإجمالي له: ${currency.format(totalCredit)}"),
+            pw.Text("الرصيد النهائي: ${currency.format(finalBalance)}"),
+          ],
+        );
+      })
+    );
+    await Printing.layoutPdf(onLayout: (format) async => doc.save());
+  }
+}
+DART
+
+      - name: Add required packages
+        working-directory: client_accounts_app
+        run: |
+          flutter pub add sqflite path path_provider intl pdf printing
+
+      - name: Build debug APK (no keystore needed)
+        working-directory: client_accounts_app
+        run: |
+          flutter build apk --debug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: client_accounts_app/build/app/outputs/flutter-apk/app-debug.apk
